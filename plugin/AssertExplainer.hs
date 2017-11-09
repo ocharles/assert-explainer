@@ -176,4 +176,4 @@ getDictionary guts dictTy = do
 
 assert :: Bool -> IO ()
 assert True = return ()
-assert False = putStrLn "Assertion failed!"
+assert False = error "Assertion failed!"
