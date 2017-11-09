@@ -155,9 +155,7 @@ getDictionary guts dictTy = do
                 }
             wCs = mkSimpleWC [cc_ev nonC]
         (_, evBinds) <- second evBindMapBinds <$> runTcS (solveWanteds wCs)
-        bnds <- initDsTc $ dsEvBinds evBinds
-
-        return bnds
+        initDsTc $ dsEvBinds evBinds
 
     case bnds of
       [NonRec _ dict] -> return dict
