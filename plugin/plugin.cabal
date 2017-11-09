@@ -9,5 +9,5 @@ library
   build-depends: base, ghc, syb, containers, template-haskell
   exposed-modules: AssertExplainer
 
-  other-modules: HERMIT.GHC.TypeChecker
+  other-modules: HERMIT.GHC.TypeChecker, Explain
   ghc-options: -Wall

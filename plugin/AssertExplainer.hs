@@ -1,9 +1,11 @@
 {-# LANGUAGE TemplateHaskell #-}
 
-module AssertExplainer where
+module AssertExplainer (plugin, assert) where
+
+import qualified Explain
 
 import Control.Arrow (second)
-import Data.Generics hiding (mkTyConApp)
+import Data.Generics hiding (mkTyConApp, TyCon)
 import Data.Traversable
 import DsBinds
 import DsMonad
@@ -18,102 +20,105 @@ import TcSMonad
 import TcSimplify
 import Unique
 
+-- | The @assert-explainer@ plugin intercepts calls to 'assert' and tries to
+-- explain them if they fail. You can use this plugin by depending on the
+-- @assert-explainer@ library, and then adding:
+--
+-- @{-# OPTIONS -fplugin=AssertExplainer #-}@
+--
+-- to your test pragmas.
 plugin :: Plugin
-plugin = defaultPlugin {
-  installCoreToDos = install
-  }
+plugin =
+  defaultPlugin { installCoreToDos = install }
+
 
 install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
 install _ todo =
   return (CoreDoPluginPass "assert-explainer" explain : todo)
 
+
+-- | A core-to-core pass that finds 'assert' calls and adds failure reasoning.
 explain :: ModGuts -> CoreM ModGuts
 explain guts = do
   mg_binds' <- everywhereM (mkM (rewriteAssert guts)) (mg_binds guts)
   return guts { mg_binds = mg_binds' }
 
-isAssert :: Var -> Bool
-isAssert v =
-  moduleNameString (moduleName (nameModule (varName v))) == "AssertExplainer" &&
-  occNameString (nameOccName (varName v)) == "assert"
 
+-- | Rewrite an 'assert' call into further analysis on the expression being asserted.
 rewriteAssert :: ModGuts -> Expr CoreBndr -> CoreM (Expr CoreBndr)
-rewriteAssert guts e =
+rewriteAssert guts e = do
+  assertId <- nameToId 'assert
   case e of
-    App (Var v) body | isAssert v -> do
-      putMsg $ pprCoreExpr body
-      name <- mkSysLocalM (fsLit "foo") (exprType body)
-      (trueDatacon, trueId) <- do
-        Just trueName <- thNameToGhcName 'True
-        (,) <$> lookupDataCon trueName <*> lookupId trueName
-      falseDatacon <- do
-        Just falseName <- thNameToGhcName 'False
-        lookupDataCon falseName
+    App (Var v) body | v == assertId -> do
+      name <- mkSysLocalM (fsLit "assertBody") (exprType body)
+      id'True <- nameToId 'True
+      dataCon'True <- nameToDatacon 'True
+      dataCon'False <- nameToDatacon 'False
+      expr'bind <- mkBind guts
       result <-
         Case body name (exprType (App (Var v) body))
           <$> sequence
-            [ (,,) <$> pure (DataAlt falseDatacon) <*> pure [] <*> explainFvs guts body
-            , pure (DataAlt trueDatacon, [], App (Var v) (Var trueId))
+            [ (,,) <$> pure (DataAlt dataCon'False) <*> pure [] <*> (expr'bind <$> explainFvs guts body <*> pure e)
+            , pure (DataAlt dataCon'True, [], App (Var v) (Var id'True))
             ]
       putMsg $ pprCoreExpr result
       return result
     _ -> return e
 
+
+-- | Given any expression, try and 'Show' all of the free variables.
 explainFvs :: ModGuts -> Expr CoreBndr -> CoreM (Expr CoreBndr)
 explainFvs guts body = do
   putStrLnId <- nameToId 'putStrLn
-  showId <- nameToId 'show
-  concatId <- nameToId '(++)
   explains <- for (uniqSetToList (exprFreeVars body)) $ \v -> do
-    prefix <- mkStringExpr (occNameString (nameOccName (varName v)) ++ ": ")
-    showTyCon <- do
-      Just name <- thNameToGhcName ''Show
-      lookupTyCon name
-    dict <- getDictionary guts (mkTyConApp showTyCon [ exprType (Var v)])
+    expr'varName <- mkStringExpr (occNameString (nameOccName (varName v)))
+    tyCon'Show <- nameToTyCon ''Show
+    dict <- getDictionary guts (mkTyConApp tyCon'Show [ exprType (Var v)])
+    id'explainShow <- nameToId 'Explain.explainShow
     return $ App (Var putStrLnId) $
-      Var concatId
-        `App` Type (exprType (mkCharExpr 'a'))
-        `App` prefix
-        `App` (Var showId `App` Type (exprType (Var v)) `App` dict `App` Var v)
+      Var id'explainShow
+        `App` Type (exprType (Var v))
+        `App` dict
+        `App` expr'varName
+        `App` Var v
 
-  bind <- do
-    monad <- do
-      Just name <- thNameToGhcName ''Monad
-      lookupTyCon name
-    io <- do
-      Just name <- thNameToGhcName ''IO
-      lookupTyCon name
-    bind <- nameToId '(>>)
-    ioDict <- getDictionary guts (mkTyConApp monad [mkTyConTy io])
-    let unmonad = snd . splitAppTy
-    return $ \a b ->
-      Var bind
-        `App` Type (mkTyConTy io)
-        `App` ioDict
-        `App` Type (unmonad $ exprType a)
-        `App` Type (unmonad $ exprType b)
-        `App` a
-        `App` b
-
+  bind <- mkBind guts
   return (foldl1 bind explains)
+
+-- | A macro to produce 'IO' sequencing with '(>>)'.
+mkBind :: ModGuts -> CoreM (CoreExpr -> CoreExpr -> CoreExpr)
+mkBind guts = do
+  tyCon'Monad <- nameToTyCon ''Monad
+  tyCon'IO <- nameToTyCon ''IO
+  id'bind <- nameToId '(>>)
+  ioDict <- getDictionary guts (mkTyConApp tyCon'Monad [mkTyConTy tyCon'IO])
+  let unMonad = snd . splitAppTy
+  return $ \a b ->
+    Var id'bind
+      `App` Type (mkTyConTy tyCon'IO)
+      `App` ioDict
+      `App` Type (unMonad $ exprType a)
+      `App` Type (unMonad $ exprType b)
+      `App` a
+      `App` b
+
 
 nameToId :: TH.Name -> CoreM Id
 nameToId n = do
   Just name <- thNameToGhcName n
   lookupId name
 
-occAttributes :: OccName -> String
-occAttributes o = "(" ++ ns ++ vo ++ tv ++ tc ++ d ++ ds ++ s ++ v ++ ")"
-  where
-    ns = (showSDocUnsafe $ pprNameSpaceBrief $ occNameSpace o) ++ ", "
-    vo = if isVarOcc     o then "Var "     else ""
-    tv = if isTvOcc      o then "Tv "      else ""
-    tc = if isTcOcc      o then "Tc "      else ""
-    d  = if isDataOcc    o then "Data "    else ""
-    ds = if isDataSymOcc o then "DataSym " else ""
-    s  = if isSymOcc     o then "Sym "     else ""
-    v  = if isValOcc     o then "Val "     else ""
 
+nameToDatacon :: TH.Name -> CoreM DataCon
+nameToDatacon n = do
+  Just trueName <- thNameToGhcName n
+  lookupDataCon trueName
+
+
+nameToTyCon :: TH.Name -> CoreM TyCon
+nameToTyCon n = do
+  Just trueName <- thNameToGhcName n
+  lookupTyCon trueName
 
 -- Blindly copied from HERMIT & Herbie
 
