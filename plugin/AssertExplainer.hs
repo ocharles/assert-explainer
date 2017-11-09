@@ -174,6 +174,8 @@ getDictionary guts dictTy = do
         dynFlags <- getDynFlags
         error $ showSDoc dynFlags (ppr dictTy)
 
+-- | Assert that a 'Bool' expression is true. Throws if the expression
+-- is not true.
 assert :: Bool -> IO ()
 assert True = return ()
 assert False = error "Assertion failed!"
