@@ -122,6 +122,13 @@ nameToTyCon n = do
   lookupTyCon trueName
 
 
+-- | Assert that a 'Bool' expression is true. Throws if the expression
+-- is not true.
+assert :: Bool -> IO ()
+assert True = return ()
+assert False = error "Assertion failed!"
+
+
 --------------------------------------------------------------------------------
 
 -- Blindly copied from HERMIT & Herbie
@@ -162,9 +169,3 @@ getDictionary guts dictTy = do
       _ -> do
         dynFlags <- getDynFlags
         error $ showSDoc dynFlags (ppr dictTy)
-
--- | Assert that a 'Bool' expression is true. Throws if the expression
--- is not true.
-assert :: Bool -> IO ()
-assert True = return ()
-assert False = error "Assertion failed!"
