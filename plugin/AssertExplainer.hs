@@ -2,32 +2,21 @@
 
 module AssertExplainer where
 
-import Data.Traversable
-import Class
-import DsBinds
-import DsMonad
-import GhcPlugins hiding (trace)
-import Unique
-import MkId
-import PrelNames
-import UniqSupply
-import TcRnMonad
-import TcSimplify
-import Type
-import HERMIT.GHC.TypeChecker
-import ErrUtils (pprErrMsgBagWithLoc)
-import DsMonad
-import TcSMonad
-import DsBinds
 import Control.Arrow (second)
-import TcSimplify
+import Data.Generics hiding (mkTyConApp)
+import Data.Traversable
+import DsBinds
+import DsMonad
+import ErrUtils (pprErrMsgBagWithLoc)
+import GhcPlugins
+import HERMIT.GHC.TypeChecker
+import qualified Language.Haskell.TH.Syntax as TH
+import PprCore (pprCoreExpr)
 import TcEvidence
 import TcRnMonad
-import TcRnTypes
-import PprCore (pprCoreExpr)
-import Data.Data hiding (mkTyConApp)
-import Data.Generics hiding (mkTyConApp)
-import GhcPlugins
+import TcSMonad
+import TcSimplify
+import Unique
 
 plugin :: Plugin
 plugin = defaultPlugin {
@@ -52,18 +41,14 @@ rewriteAssert :: ModGuts -> Expr CoreBndr -> CoreM (Expr CoreBndr)
 rewriteAssert guts e =
   case e of
     App (Var v) body | isAssert v -> do
-      liftIO $ putStrLn (showExpr 0 body)
       putMsg $ pprCoreExpr body
       name <- mkSysLocalM (fsLit "foo") (exprType body)
       (trueDatacon, trueId) <- do
         Just trueName <- thNameToGhcName 'True
         (,) <$> lookupDataCon trueName <*> lookupId trueName
-      (falseDatacon, falseId) <- do
+      falseDatacon <- do
         Just falseName <- thNameToGhcName 'False
-        (,) <$> lookupDataCon falseName <*> lookupId falseName
-      bind <- do
-        Just bindName <- thNameToGhcName '(>>)
-        lookupId bindName
+        lookupDataCon falseName
       result <-
         Case body name (exprType (App (Var v) body))
           <$> sequence
@@ -79,18 +64,17 @@ explainFvs guts body = do
   putStrLnId <- nameToId 'putStrLn
   showId <- nameToId 'show
   concatId <- nameToId '(++)
-  let stringType = exprType (Lit (mkMachString ""))
   explains <- for (uniqSetToList (exprFreeVars body)) $ \v -> do
-      prefix <- mkStringExpr (occNameString (nameOccName (varName v)) ++ ": ")
-      show <- do
-        Just name <- thNameToGhcName ''Show
-        lookupTyCon name
-      dict <- getDictionary guts (mkTyConApp show [ exprType (Var v)])
-      return $ App (Var putStrLnId) $
-        Var concatId
-          `App` Type (exprType (mkCharExpr 'a'))
-          `App` prefix
-          `App` (Var showId `App` Type (exprType (Var v)) `App` dict `App` Var v)
+    prefix <- mkStringExpr (occNameString (nameOccName (varName v)) ++ ": ")
+    showTyCon <- do
+      Just name <- thNameToGhcName ''Show
+      lookupTyCon name
+    dict <- getDictionary guts (mkTyConApp showTyCon [ exprType (Var v)])
+    return $ App (Var putStrLnId) $
+      Var concatId
+        `App` Type (exprType (mkCharExpr 'a'))
+        `App` prefix
+        `App` (Var showId `App` Type (exprType (Var v)) `App` dict `App` Var v)
 
   bind <- do
     monad <- do
@@ -100,7 +84,6 @@ explainFvs guts body = do
       Just name <- thNameToGhcName ''IO
       lookupTyCon name
     bind <- nameToId '(>>)
-    liftIO $ putStrLn $ showExpr 0  (mkTyConApp monad [mkTyConTy io])
     ioDict <- getDictionary guts (mkTyConApp monad [mkTyConTy io])
     let unmonad = snd . splitAppTy
     return $ \a b ->
@@ -114,33 +97,10 @@ explainFvs guts body = do
 
   return (foldl1 bind explains)
 
-
+nameToId :: TH.Name -> CoreM Id
 nameToId n = do
   Just name <- thNameToGhcName n
   lookupId name
-
-showExpr :: Data a => Int -> a -> String
-showExpr n =
-  generic `extQ` machStr
-          `extQ` name `extQ` occName `extQ` moduleName `extQ` var `extQ` dataCon
-  where generic :: Data a => a -> String
-        generic t = indent n ++ "(" ++ showConstr (toConstr t)
-                 ++ space (unwords (gmapQ (showExpr (n+1)) t)) ++ ")"
-        space "" = ""
-        space s  = ' ':s
-        indent i = "\n" ++ replicate i ' '
-        string     = show :: String -> String
-
-        machStr (MachStr _) = "<<MachStr>>"
-        machStr a = generic a
-
-        showSDoc_ = showSDoc unsafeGlobalDynFlags
-
-        name       = ("{Name: "++) . (++"}") . showSDoc_ . ppr :: Name -> String
-        occName o   = "{OccName: "++ occNameString o ++ " " ++ occAttributes o ++ "}"
-        moduleName = ("{ModuleName: "++) . (++"}") . showSDoc_ . ppr :: ModuleName -> String
-        var        = ("{Var: "++) . (++"}") . showSDoc_ . ppr :: Var -> String
-        dataCon    = ("{DataCon: "++) . (++"}") . showSDoc_ . ppr :: DataCon -> String
 
 occAttributes :: OccName -> String
 occAttributes o = "(" ++ ns ++ vo ++ tv ++ tc ++ d ++ ds ++ s ++ v ++ ")"
@@ -157,6 +117,7 @@ occAttributes o = "(" ++ ns ++ vo ++ tv ++ tc ++ d ++ ds ++ s ++ v ++ ")"
 
 -- Blindly copied from HERMIT & Herbie
 
+runTcM :: ModGuts -> TcM a -> CoreM a
 runTcM guts m = do
   env <- getHscEnv
   dflags <- getDynFlags
@@ -184,7 +145,7 @@ getDictionary guts dictTy = do
                 , ctev_loc = loc
                 }
             wCs = mkSimpleWC [cc_ev nonC]
-        (x, evBinds) <- second evBindMapBinds <$> runTcS (solveWanteds wCs)
+        (_, evBinds) <- second evBindMapBinds <$> runTcS (solveWanteds wCs)
         bnds <- initDsTc $ dsEvBinds evBinds
 
 --         liftIO $ do
@@ -199,10 +160,10 @@ getDictionary guts dictTy = do
         return bnds
 
     case bnds of
-        [NonRec _ dict] -> return dict
-        otherwise -> do
-          dynFlags <- getDynFlags
-          error $ showSDoc dynFlags (ppr dictTy)
+      [NonRec _ dict] -> return dict
+      _ -> do
+        dynFlags <- getDynFlags
+        error $ showSDoc dynFlags (ppr dictTy)
 
 assert :: Bool -> IO ()
 assert True = return ()
