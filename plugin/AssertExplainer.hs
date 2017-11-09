@@ -85,6 +85,7 @@ explainFvs guts body = do
   bind <- mkBind guts
   return (foldl1 bind explains)
 
+
 -- | A macro to produce 'IO' sequencing with '(>>)'.
 mkBind :: ModGuts -> CoreM (CoreExpr -> CoreExpr -> CoreExpr)
 mkBind guts = do
@@ -119,6 +120,9 @@ nameToTyCon :: TH.Name -> CoreM TyCon
 nameToTyCon n = do
   Just trueName <- thNameToGhcName n
   lookupTyCon trueName
+
+
+--------------------------------------------------------------------------------
 
 -- Blindly copied from HERMIT & Herbie
 
