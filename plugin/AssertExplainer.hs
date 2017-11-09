@@ -157,15 +157,6 @@ getDictionary guts dictTy = do
         (_, evBinds) <- second evBindMapBinds <$> runTcS (solveWanteds wCs)
         bnds <- initDsTc $ dsEvBinds evBinds
 
---         liftIO $ do
---             putStrLn $ "dictType="++showSDoc dflags (ppr dictType)
---             putStrLn $ "dictVar="++showSDoc dflags (ppr dictVar)
---
---             putStrLn $ "nonC="++showSDoc dflags (ppr nonC)
---             putStrLn $ "wCs="++showSDoc dflags (ppr wCs)
---             putStrLn $ "bnds="++showSDoc dflags (ppr bnds)
---             putStrLn $ "x="++showSDoc dflags (ppr x)
-
         return bnds
 
     case bnds of
