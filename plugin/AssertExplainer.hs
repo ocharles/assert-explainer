@@ -1,171 +1,308 @@
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE RecordWildCards #-}
 
-module AssertExplainer (plugin, assert) where
+module AssertExplainer ( plugin, assert ) where
 
-import qualified Explain
+-- assert-explainer
+import qualified Constraint
 
-import Control.Arrow (second)
-import Data.Generics hiding (mkTyConApp, TyCon)
-import Data.Traversable
-import DsBinds
-import DsMonad
-import ErrUtils (pprErrMsgBagWithLoc)
-import GhcPlugins
-import HERMIT.GHC.TypeChecker
-import qualified Language.Haskell.TH.Syntax as TH
-import PprCore (pprCoreExpr)
-import TcEvidence
-import TcRnMonad
-import TcSMonad
-import TcSimplify
-import Unique
+-- base
+import Data.Bool ( bool )
+import Data.List ( foldl' )
+import Control.Monad.IO.Class ( liftIO )
+import Data.Foldable ( toList )
+import Data.Maybe ( catMaybes )
+  
+-- ghc
+import qualified HsUtils
+import qualified CoreUtils
+import qualified Id as GHC
+import qualified Desugar as GHC
+import qualified Finder as GHC
+import qualified GHC
+import qualified GhcPlugins as GHC
+import qualified HsExpr as Expr
+import qualified HsPat as Pat
+import qualified IfaceEnv as GHC
+import qualified PrelNames as GHC
+import qualified TcEnv as GHC
+import qualified TcEvidence as GHC
+import qualified TcExpr as GHC
+import qualified TcHsSyn as GHC
+import qualified TcRnMonad as GHC
+import qualified TcSimplify as GHC
+import qualified TcType as GHC
+import qualified TcSMonad as GHC ( runTcS )
 
--- | The @assert-explainer@ plugin intercepts calls to 'assert' and tries to
--- explain them if they fail. You can use this plugin by depending on the
--- @assert-explainer@ library, and then adding:
---
--- @{-# OPTIONS -fplugin=AssertExplainer #-}@
---
--- to your test pragmas.
-plugin :: Plugin
+-- syb
+import Data.Generics ( everywhereM, listify, mkM )
+
+
+{-|
+
+The @assert-explainer@ plugin intercepts calls to 'assert' and tries to explain
+them if they fail. You can use this plugin by depending on the
+@assert-explainer@ library, and then adding:
+
+@{-# OPTIONS -fplugin=AssertExplainer #-}@
+
+to your test pragmas.
+-}
+
+plugin :: GHC.Plugin
 plugin =
-  defaultPlugin { installCoreToDos = install }
+  GHC.defaultPlugin
+    { GHC.typeCheckResultAction = \_cliOptions -> explainAssertions }
 
 
-install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
-install _ todo =
-  return (CoreDoPluginPass "assert-explainer" explain : todo)
+data Names = Names
+  { hs_return :: GHC.Name
+  , hs_assert :: GHC.Id
+  , hs_unit :: GHC.Name
+  , hs_IO :: GHC.TyCon
+  , hs_print :: GHC.Name
+  , hs_show :: GHC.Name
+  }
 
 
--- | A core-to-core pass that finds 'assert' calls and adds failure reasoning.
-explain :: ModGuts -> CoreM ModGuts
-explain guts = do
-  mg_binds' <- everywhereM (mkM (rewriteAssert guts)) (mg_binds guts)
-  return guts { mg_binds = mg_binds' }
+explainAssertions :: GHC.ModSummary -> GHC.TcGblEnv -> GHC.TcM GHC.TcGblEnv
+explainAssertions _modSummary tcGblEnv = do 
+  hscEnv <-
+    GHC.getTopEnv
+
+  GHC.Found _ assertExplainerModule <-
+    liftIO ( GHC.findImportedModule hscEnv ( GHC.mkModuleName "AssertExplainer" ) Nothing )
+
+  names <- do
+    hs_IO <-
+      GHC.lookupTyCon ( GHC.ioTyConName )
+
+    let
+      hs_return =
+        GHC.returnIOName
+
+    hs_print <-
+      GHC.lookupOrig GHC.sYSTEM_IO ( GHC.mkVarOcc "putStrLn" )
+
+    hs_assert <-
+      GHC.lookupId
+        =<< GHC.lookupOrig assertExplainerModule ( GHC.mkVarOcc "assert" )
+
+    let
+      hs_unit =
+        GHC.varName GHC.unitDataConId
+
+    hs_show <-
+      GHC.lookupOrig GHC.gHC_SHOW ( GHC.mkVarOcc "show" )
+
+    return Names{..}
+  
+  tcg_binds <-
+    mkM ( rewriteAssert names ) `everywhereM` GHC.tcg_binds tcGblEnv
+
+  return tcGblEnv { GHC.tcg_binds = tcg_binds }
+
+
+assert :: Bool -> IO ()
+assert =
+  bool ( fail "Assertion failed!" ) ( return () )
 
 
 -- | Rewrite an 'assert' call into further analysis on the expression being asserted.
-rewriteAssert :: ModGuts -> Expr CoreBndr -> CoreM (Expr CoreBndr)
-rewriteAssert guts e = do
-  assertId <- nameToId 'assert
-  case e of
-    App (Var v) body | v == assertId -> do
-      name <- mkSysLocalM (fsLit "assertBody") (exprType body)
-      id'True <- nameToId 'True
-      dataCon'True <- nameToDatacon 'True
-      dataCon'False <- nameToDatacon 'False
-      expr'bind <- mkBind guts
-      result <-
-        Case body name (exprType (App (Var v) body))
-          <$> sequence
-            [ (,,) <$> pure (DataAlt dataCon'False) <*> pure [] <*> (expr'bind <$> explainFvs guts body <*> pure e)
-            , pure (DataAlt dataCon'True, [], App (Var v) (Var id'True))
+rewriteAssert :: Names -> Expr.HsExpr GHC.GhcTc -> GHC.TcM ( Expr.HsExpr GHC.GhcTc )
+rewriteAssert names e@( Expr.HsApp _ ( GHC.L _ ( Expr.HsVar _ ( GHC.L _ v ) ) ) ( GHC.L _ body ) ) | hs_assert names == v = do
+  GHC.L _ e <-
+    explain names body
+
+  return e
+
+rewriteAssert _ e =
+  return e
+
+
+data Typed = Typed
+  { typedExpr :: Expr.HsExpr GHC.GhcTcId
+  , typedExprType :: GHC.Type
+  }
+  
+
+explain :: Names -> Expr.HsExpr GHC.GhcTc -> GHC.TcM ( Expr.LHsExpr GHC.GhcTc )
+explain names e = do
+  -- Find all sub-expressions in the body
+  let
+    subExpressions =
+      listify isHsExpr e
+
+  -- Augment each sub-expression with its type
+  typedSubExpressions <-
+    catMaybes <$> traverse toTyped subExpressions
+
+  -- Filter the list of sub-expressions to just those that can be shown.
+  showableSubExpresions <-
+    catMaybes <$> traverse witnessShow typedSubExpressions
+
+  -- Build an anonymous function to describe all of these subexpressions
+  let 
+    diagnosticArgs =
+      GHC.mkTemplateLocals ( typedExprType <$> showableSubExpresions )
+
+    diagnose te name =
+      Expr.BodyStmt GHC.NoExt 
+        ( GHC.noLoc
+            ( Expr.HsApp GHC.NoExt
+                ( GHC.noLoc
+                    ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( hs_print names ) ) )
+                )
+                ( GHC.noLoc
+                    ( Expr.HsApp GHC.NoExt
+                        ( GHC.noLoc
+                            ( Expr.HsApp GHC.NoExt
+                                ( GHC.noLoc
+                                    ( Expr.HsVar GHC.NoExt
+                                        ( GHC.noLoc GHC.mappendName )
+                                    )
+                                )
+                                ( GHC.noLoc
+                                    ( Expr.HsLit GHC.NoExt
+                                        ( GHC.HsString
+                                            GHC.NoSourceText
+                                            ( GHC.fsLit ( GHC.renderWithStyle GHC.unsafeGlobalDynFlags ( GHC.ppr ( typedExpr te ) ) ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags ) ++ " = " ) )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                        ( GHC.noLoc
+                            ( Expr.HsApp GHC.NoExt
+                                ( GHC.noLoc ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( hs_show names ) ) ) )
+                                ( GHC.noLoc ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( GHC.idName name ) ) ) )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        ( GHC.mkRnSyntaxExpr GHC.thenIOName )
+        Expr.noSyntaxExpr
+
+    diagnosticFunction = 
+      foldl'
+        ( \e name -> abstract name e )
+        ( Expr.HsDo GHC.NoExt
+            Expr.DoExpr
+            ( GHC.noLoc
+                ( map
+                    GHC.noLoc
+                    ( zipWith diagnose showableSubExpresions diagnosticArgs
+                        ++
+                          [ Expr.LastStmt GHC.NoExt
+                              ( GHC.noLoc ( returnUnit names ) )
+                              False
+                              Expr.noSyntaxExpr
+                          ]
+                    )
+                ) 
+            ) 
+        )
+        ( reverse diagnosticArgs )
+
+  -- Build the type of the diagnostic function
+  let
+    fTy =
+      foldr
+        GHC.mkFunTy
+        ( GHC.mkTyConApp ( hs_IO names ) [ GHC.mkTyConTy GHC.unitTyCon ] )
+        ( map typedExprType showableSubExpresions )
+
+  ( GHC.L _ ifExpr', wanteds ) <-
+    GHC.captureConstraints
+      ( GHC.tcMonoExpr
+        ( GHC.noLoc diagnosticFunction )
+        ( GHC.Check fTy )
+      )
+
+  wrapper <-
+    GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd <$> GHC.runTcS ( GHC.solveWanteds wanteds )
+
+  GHC.zonkTopLExpr
+    ( foldl
+        ( \a b -> GHC.noLoc ( Expr.HsApp GHC.NoExt a b ) )
+        ( GHC.noLoc ( Expr.HsWrap GHC.NoExt wrapper ifExpr' ) )
+        ( map ( GHC.noLoc . typedExpr ) showableSubExpresions )
+    )
+
+
+isHsExpr :: Expr.HsExpr GHC.GhcTc -> Bool 
+isHsExpr ( Expr.HsPar{} ) =
+  False
+isHsExpr ( Expr.HsLit{} ) =
+  False
+isHsExpr ( Expr.HsOverLit{} ) =
+  False
+isHsExpr _ =
+  True
+
+
+returnUnit names =
+  Expr.HsApp GHC.NoExt
+    ( GHC.noLoc ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( hs_return names ) ) ) )
+    ( GHC.noLoc ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( hs_unit names ) ) ) )
+
+
+toTyped e = do
+  hs_env  <-
+    GHC.getTopEnv
+
+  ( _, mbe ) <-
+    liftIO ( GHC.deSugarExpr hs_env ( GHC.noLoc e ) )
+
+  return ( ( \x -> Typed e ( CoreUtils.exprType x ) ) <$> mbe )
+
+
+witnessShow tExpr = do
+  showTyCon <-
+    GHC.tcLookupTyCon GHC.showClassName
+
+  dictName <-
+    GHC.newName ( GHC.mkDictOcc ( GHC.mkVarOcc "magic" ) )
+
+  let
+    dict_ty =
+      GHC.mkTyConApp showTyCon [ typedExprType tExpr ]
+
+    dict_var =
+      GHC.mkVanillaGlobal dictName dict_ty
+
+  GHC.EvBinds evBinds <-
+    Constraint.getDictionaryBindings dict_var dict_ty
+
+  case toList evBinds of
+    [] ->
+      return Nothing
+
+    _ ->
+      return ( Just tExpr )
+
+
+abstract name e =
+  Expr.HsLam GHC.NoExt
+    Expr.MG
+      { Expr.mg_ext = GHC.NoExt
+      , Expr.mg_alts =
+          GHC.noLoc
+            [ GHC.noLoc
+                Expr.Match
+                  { Expr.m_ext = GHC.NoExt
+                  , Expr.m_ctxt = Expr.LambdaExpr
+                  , Expr.m_pats =
+                      [ GHC.noLoc
+                          ( Pat.VarPat GHC.NoExt
+                              ( GHC.noLoc ( GHC.idName name ) )
+                          )
+                      ]
+                  , Expr.m_grhss = GHC.unguardedGRHSs ( GHC.noLoc e )
+                  }
             ]
-      putMsg $ pprCoreExpr result
-      return result
-    _ -> return e
-
-
--- | Given any expression, try and 'Show' all of the free variables.
-explainFvs :: ModGuts -> Expr CoreBndr -> CoreM (Expr CoreBndr)
-explainFvs guts body = do
-  putStrLnId <- nameToId 'putStrLn
-  explains <- for (uniqSetToList (exprFreeVars body)) $ \v -> do
-    expr'varName <- mkStringExpr (occNameString (nameOccName (varName v)))
-    tyCon'Show <- nameToTyCon ''Show
-    dict <- getDictionary guts (mkTyConApp tyCon'Show [ exprType (Var v)])
-    id'explainShow <- nameToId 'Explain.explainShow
-    return $ App (Var putStrLnId) $
-      Var id'explainShow
-        `App` Type (exprType (Var v))
-        `App` dict
-        `App` expr'varName
-        `App` Var v
-
-  bind <- mkBind guts
-  return (foldl1 bind explains)
-
-
--- | A macro to produce 'IO' sequencing with '(>>)'.
-mkBind :: ModGuts -> CoreM (CoreExpr -> CoreExpr -> CoreExpr)
-mkBind guts = do
-  tyCon'Monad <- nameToTyCon ''Monad
-  tyCon'IO <- nameToTyCon ''IO
-  id'bind <- nameToId '(>>)
-  ioDict <- getDictionary guts (mkTyConApp tyCon'Monad [mkTyConTy tyCon'IO])
-  let unMonad = snd . splitAppTy
-  return $ \a b ->
-    Var id'bind
-      `App` Type (mkTyConTy tyCon'IO)
-      `App` ioDict
-      `App` Type (unMonad $ exprType a)
-      `App` Type (unMonad $ exprType b)
-      `App` a
-      `App` b
-
-
-nameToId :: TH.Name -> CoreM Id
-nameToId n = do
-  Just name <- thNameToGhcName n
-  lookupId name
-
-
-nameToDatacon :: TH.Name -> CoreM DataCon
-nameToDatacon n = do
-  Just trueName <- thNameToGhcName n
-  lookupDataCon trueName
-
-
-nameToTyCon :: TH.Name -> CoreM TyCon
-nameToTyCon n = do
-  Just trueName <- thNameToGhcName n
-  lookupTyCon trueName
-
-
--- | Assert that a 'Bool' expression is true. Throws if the expression
--- is not true.
-assert :: Bool -> IO ()
-assert True = return ()
-assert False = error "Assertion failed!"
-
-
---------------------------------------------------------------------------------
-
--- Blindly copied from HERMIT & Herbie
-
-runTcM :: ModGuts -> TcM a -> CoreM a
-runTcM guts m = do
-  env <- getHscEnv
-  dflags <- getDynFlags
-  -- What is the effect of HsSrcFile (should we be using something else?)
-  -- What should the boolean flag be set to?
-  (msgs, mr) <- liftIO $ initTcFromModGuts env guts HsSrcFile False m
-  let showMsgs (warns, errs) = showSDoc dflags $ vcat
-                                               $    text "Errors:" : pprErrMsgBagWithLoc errs
-                                                 ++ text "Warnings:" : pprErrMsgBagWithLoc warns
-  maybe (fail $ showMsgs msgs) return mr
-
-getDictionary :: ModGuts -> Type -> CoreM CoreExpr
-getDictionary guts dictTy = do
-    let dictVar = mkGlobalVar
-            VanillaId
-            (mkSystemName (mkUnique 'z' 1337) (mkVarOcc "magicDictionaryName"))
-            dictTy
-            vanillaIdInfo
-
-    bnds <- runTcM guts $ do
-        loc <- getCtLocM (GivenOrigin UnkSkol) Nothing
-        let nonC = mkNonCanonical CtWanted
-                { ctev_pred = varType dictVar
-                , ctev_dest = EvVarDest dictVar
-                , ctev_loc = loc
-                }
-            wCs = mkSimpleWC [cc_ev nonC]
-        (_, evBinds) <- second evBindMapBinds <$> runTcS (solveWanteds wCs)
-        initDsTc $ dsEvBinds evBinds
-
-    case bnds of
-      [NonRec _ dict] -> return dict
-      _ -> do
-        dynFlags <- getDynFlags
-        error $ showSDoc dynFlags (ppr dictTy)
+      , Expr.mg_origin = GHC.Generated
+      }
+              
