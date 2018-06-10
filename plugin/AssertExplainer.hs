@@ -14,7 +14,7 @@ import Control.Monad ( guard )
 import Control.Monad.IO.Class ( liftIO )
 import Data.Foldable ( toList )
 import Data.Maybe ( catMaybes )
-  
+
 -- ghc
 import qualified Convert as GHC
 import qualified CoreUtils
@@ -34,6 +34,10 @@ import qualified TcRnMonad as GHC
 import qualified TcSMonad as GHC ( runTcS )
 import qualified TcSimplify as GHC
 import qualified TcType as GHC
+
+-- prettyprinter
+import qualified Data.Text.Prettyprint.Doc as PP
+import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
 
 -- syb
 import Data.Generics ( everywhereM, listify, mkM )
@@ -60,21 +64,7 @@ plugin =
 
 
 explainAssertions :: GHC.ModSummary -> GHC.TcGblEnv -> GHC.TcM GHC.TcGblEnv
-explainAssertions _modSummary tcGblEnv = do 
-  tcg_binds <-
-    mkM rewriteAssert `everywhereM` GHC.tcg_binds tcGblEnv
-
-  return tcGblEnv { GHC.tcg_binds = tcg_binds }
-
-
-assert :: Bool -> IO ()
-assert =
-  bool ( fail "Assertion failed!" ) ( return () )
-
-
--- | Rewrite an 'assert' call into further analysis on the expression being asserted.
-rewriteAssert :: Expr.LHsExpr GHC.GhcTc -> GHC.TcM ( Expr.LHsExpr GHC.GhcTc )
-rewriteAssert e@( GHC.L _ ( Expr.HsApp _ ( GHC.L _ ( Expr.HsVar _ ( GHC.L _ v ) ) ) ( GHC.L _ body ) ) ) = do
+explainAssertions _modSummary tcGblEnv = do
   hscEnv <-
     GHC.getTopEnv
 
@@ -85,34 +75,44 @@ rewriteAssert e@( GHC.L _ ( Expr.HsApp _ ( GHC.L _ ( Expr.HsVar _ ( GHC.L _ v ) 
     GHC.lookupId
       =<< GHC.lookupOrig assertExplainerModule ( GHC.mkVarOcc "assert" )
 
-  if v == assertName then
-    explain body
-  else
-    return e
+  tcg_binds <-
+    mkM ( rewriteAssert assertName ) `everywhereM` GHC.tcg_binds tcGblEnv
 
-rewriteAssert e =
+  return tcGblEnv { GHC.tcg_binds = tcg_binds }
+
+
+assert :: Bool -> IO ()
+assert =
+  bool ( fail "Assertion failed!" ) ( return () )
+
+
+-- | Rewrite an 'assert' call into further analysis on the expression being asserted.
+rewriteAssert :: GHC.Id -> Expr.LHsExpr GHC.GhcTc -> GHC.TcM ( Expr.LHsExpr GHC.GhcTc )
+rewriteAssert assertName ( GHC.L _ ( Expr.HsApp _ ( GHC.L _ ( Expr.HsVar _ ( GHC.L _ v ) ) ) body ) ) | assertName == v = do
+  explain body
+rewriteAssert _ e =
   return e
 
 
 data Typed = Typed
-  { typedExpr :: Expr.HsExpr GHC.GhcTcId
+  { typedExpr :: Expr.LHsExpr GHC.GhcTcId
   , typedExprType :: GHC.Type
   }
-  
 
-explain :: Expr.HsExpr GHC.GhcTc -> GHC.TcM ( Expr.LHsExpr GHC.GhcTc )
+
+explain :: Expr.LHsExpr GHC.GhcTc -> GHC.TcM ( Expr.LHsExpr GHC.GhcTc )
 explain toExplain = do
   -- Find all sub-expressions in the body
   let
     subExpressions =
-      listify isHsExpr toExplain
+      listify isInterestingSubexpr toExplain
 
   -- Augment each sub-expression with its type
   typedSubExpressions <-
     catMaybes <$> traverse toTyped subExpressions
 
   -- Filter the list of sub-expressions to just those that can be shown.
-  showableSubExpresions <-
+  given:showableSubExpresions <-
     catMaybes <$> traverse witnessShow typedSubExpressions
 
   -- Build an anonymous function to describe all of these subexpressions
@@ -129,12 +129,33 @@ explain toExplain = do
               TH.noBindS ( diagnoseExpr te name )
 
             diagnosed =
-              zipWith diagnose showableSubExpresions diagnosticArgs
+              case zipWith diagnose showableSubExpresions diagnosticArgs of
+                [] ->
+                  []
 
-          foldl'
-            ( \e name -> TH.lam1E ( TH.varP name ) e )
-            ( TH.doE diagnosed )
-            ( reverse diagnosticArgs )
+                diags ->
+                  [ TH.noBindS
+                      ( TH.doE
+                          ( TH.noBindS [| putStrLn "I found the following sub-expressions:" |]
+                              : diags
+                          )
+                      )
+                  ]
+
+          topName <-
+            TH.newName "x"
+
+          TH.lam1E
+            ( TH.varP topName )
+            ( foldl'
+                ( \e name -> TH.lam1E ( TH.varP name ) e )
+                ( TH.condE
+                    ( TH.varE topName )
+                    [| return () |]
+                    ( TH.doE ( assertionFailed given : diagnosed ) )
+                )
+                ( reverse diagnosticArgs )
+            )
 
   -- Rename the Template Haskell source
   ( diagnosticFunction, _ ) <-
@@ -149,7 +170,10 @@ explain toExplain = do
       ( foldr
           GHC.mkFunTy
           ( GHC.mkTyConApp io [ GHC.mkTyConTy GHC.unitTyCon ] )
-          ( map typedExprType showableSubExpresions ) 
+          ( map
+              typedExprType
+              ( given : showableSubExpresions )
+          )
       )
 
   -- Type check our diagnostic function to find which dictionaries need to be
@@ -162,9 +186,16 @@ explain toExplain = do
       )
 
   -- Solve wanted constraints and build a wrapper.
-  wrapper <-
-    GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
+  evBinds <-
+    GHC.EvBinds . GHC.evBindMapBinds . snd
       <$> GHC.runTcS ( GHC.solveWanteds wanteds )
+
+  ( _, zonkedEvBinds ) <-
+    GHC.zonkTcEvBinds GHC.emptyZonkEnv evBinds
+
+  let
+    wrapper =
+      GHC.mkWpLet zonkedEvBinds
 
   -- Apply the wrapper to our type checked syntax and fully saturate the
   -- diagnostic function with the necessary arguments.
@@ -172,7 +203,10 @@ explain toExplain = do
     ( foldl
         GHC.mkHsApp
         ( GHC.mkLHsWrap wrapper ifExpr' )
-        ( map ( GHC.noLoc . typedExpr ) showableSubExpresions )
+        ( map
+            typedExpr
+            ( given : showableSubExpresions )
+        )
     )
 
 
@@ -185,30 +219,54 @@ diagnoseExpr te name =
         ( GHC.ppr ( typedExpr te ) )
         ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags )
   in
-  [| putStrLn ( ppExpr ++ " = " ++ show $( TH.varE name ) ) |]
+  -- [| PP.putDoc ( PP.pretty ppExpr <> " = " <> PP.pretty ( show $( TH.varE name ) ) ) |]
+  [| putStrLn ( "  - " <> ppExpr <> " = " <> show $( TH.varE name ) ) |]
 
 
-isHsExpr :: Expr.HsExpr GHC.GhcTc -> Bool 
-isHsExpr Expr.HsPar{} =
+assertionFailed :: Typed -> TH.StmtQ
+assertionFailed te =
+  let
+    ppExpr =
+      GHC.renderWithStyle
+        GHC.unsafeGlobalDynFlags
+        ( GHC.ppr ( typedExpr te ) )
+        ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags )
+
+    srcLoc =
+      GHC.renderWithStyle
+        GHC.unsafeGlobalDynFlags
+        ( GHC.ppr ( case typedExpr te of GHC.L l _ -> l ) )
+        ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags )
+    
+  in
+  TH.noBindS
+    [| do
+         putStrLn ( "Assertion failed! " <> ppExpr <> " /= True (at " <> srcLoc <> ")" )
+         putStrLn ""
+    |]
+
+
+isInterestingSubexpr :: Expr.LHsExpr GHC.GhcTc -> Bool
+isInterestingSubexpr ( GHC.L _ Expr.HsPar{} ) =
   False
-isHsExpr Expr.HsLit{} =
+isInterestingSubexpr ( GHC.L _ Expr.HsLit{}) =
   False
-isHsExpr Expr.HsOverLit{} =
+isInterestingSubexpr ( GHC.L _ Expr.HsOverLit{} ) =
   False
-isHsExpr Expr.HsWrap{} =
+isInterestingSubexpr ( GHC.L _ Expr.HsWrap{} ) =
   False
-isHsExpr _ =
+isInterestingSubexpr _ =
   True
 
 
 -- | Given a type-checked expression, pair the expression up with its Type.
-toTyped :: Expr.HsExpr GHC.GhcTc -> GHC.TcM ( Maybe Typed )
+toTyped :: Expr.LHsExpr GHC.GhcTc -> GHC.TcM ( Maybe Typed )
 toTyped e = do
   hs_env  <-
     GHC.getTopEnv
 
   ( _, mbe ) <-
-    liftIO ( GHC.deSugarExpr hs_env ( GHC.noLoc e ) )
+    liftIO ( GHC.deSugarExpr hs_env e )
 
   return ( ( \x -> Typed e ( CoreUtils.exprType x ) ) <$> mbe )
 

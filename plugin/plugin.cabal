@@ -11,6 +11,7 @@ library
                , syb
                , containers
                , template-haskell
+               , prettyprinter
   exposed-modules: AssertExplainer 
   other-modules: Constraint
   ghc-options: -Wall
