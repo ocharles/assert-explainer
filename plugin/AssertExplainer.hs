@@ -1,5 +1,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module AssertExplainer ( plugin, assert ) where
 
@@ -14,28 +15,36 @@ import Data.Foldable ( toList )
 import Data.Maybe ( catMaybes )
   
 -- ghc
-import qualified HsUtils
+import qualified Convert as GHC
 import qualified CoreUtils
-import qualified Id as GHC
 import qualified Desugar as GHC
 import qualified Finder as GHC
 import qualified GHC
 import qualified GhcPlugins as GHC
 import qualified HsExpr as Expr
 import qualified HsPat as Pat
+import qualified HsUtils
+import qualified HsUtils as GHC
+import qualified Id as GHC
 import qualified IfaceEnv as GHC
 import qualified PrelNames as GHC
+import qualified RnExpr as GHC
 import qualified TcEnv as GHC
 import qualified TcEvidence as GHC
 import qualified TcExpr as GHC
 import qualified TcHsSyn as GHC
 import qualified TcRnMonad as GHC
+import qualified TcSMonad as GHC ( runTcS )
 import qualified TcSimplify as GHC
 import qualified TcType as GHC
-import qualified TcSMonad as GHC ( runTcS )
+import qualified Unique
 
 -- syb
 import Data.Generics ( everywhereM, listify, mkM )
+
+-- template-haskell
+import Language.Haskell.TH as TH
+import Language.Haskell.TH.Syntax as TH
 
 
 {-|
@@ -65,37 +74,42 @@ data Names = Names
   }
 
 
-explainAssertions :: GHC.ModSummary -> GHC.TcGblEnv -> GHC.TcM GHC.TcGblEnv
-explainAssertions _modSummary tcGblEnv = do 
+resolveNames :: GHC.TcM Names
+resolveNames = do 
   hscEnv <-
     GHC.getTopEnv
 
   GHC.Found _ assertExplainerModule <-
     liftIO ( GHC.findImportedModule hscEnv ( GHC.mkModuleName "AssertExplainer" ) Nothing )
 
-  names <- do
-    hs_IO <-
-      GHC.lookupTyCon ( GHC.ioTyConName )
+  hs_IO <-
+    GHC.lookupTyCon ( GHC.ioTyConName )
 
-    let
-      hs_return =
-        GHC.returnIOName
+  let
+    hs_return =
+      GHC.returnIOName
 
-    hs_print <-
-      GHC.lookupOrig GHC.sYSTEM_IO ( GHC.mkVarOcc "putStrLn" )
+  hs_print <-
+    GHC.lookupOrig GHC.sYSTEM_IO ( GHC.mkVarOcc "putStrLn" )
 
-    hs_assert <-
-      GHC.lookupId
-        =<< GHC.lookupOrig assertExplainerModule ( GHC.mkVarOcc "assert" )
+  hs_assert <-
+    GHC.lookupId
+      =<< GHC.lookupOrig assertExplainerModule ( GHC.mkVarOcc "assert" )
 
-    let
-      hs_unit =
-        GHC.varName GHC.unitDataConId
+  let
+    hs_unit =
+      GHC.varName GHC.unitDataConId
 
-    hs_show <-
-      GHC.lookupOrig GHC.gHC_SHOW ( GHC.mkVarOcc "show" )
+  hs_show <-
+    GHC.lookupOrig GHC.gHC_SHOW ( GHC.mkVarOcc "show" )
 
-    return Names{..}
+  return Names{..}
+
+
+explainAssertions :: GHC.ModSummary -> GHC.TcGblEnv -> GHC.TcM GHC.TcGblEnv
+explainAssertions _modSummary tcGblEnv = do 
+  names <-
+    resolveNames
   
   tcg_binds <-
     mkM ( rewriteAssert names ) `everywhereM` GHC.tcg_binds tcGblEnv
@@ -142,88 +156,51 @@ explain names e = do
     catMaybes <$> traverse witnessShow typedSubExpressions
 
   -- Build an anonymous function to describe all of these subexpressions
+  Right expr <- fmap ( GHC.convertToHsExpr GHC.noSrcSpan ) $ liftIO $ TH.runQ $ do
+    diagnosticArgs <-
+      sequence ( TH.newName "x" <$ showableSubExpresions )
+
+    let
+      diagnose te name =
+        TH.noBindS ( diagnoseExpr te name )
+
+      diagnosed =
+        zipWith diagnose showableSubExpresions diagnosticArgs
+
+    id
+      ( foldl'
+          ( \e name -> TH.lam1E ( TH.varP name ) e )
+          ( TH.doE diagnosed )
+          ( reverse diagnosticArgs )
+      )
+
   let 
-    diagnosticArgs =
-      GHC.mkTemplateLocals ( typedExprType <$> showableSubExpresions )
-
-    diagnose te name =
-      Expr.BodyStmt GHC.NoExt 
-        ( GHC.noLoc
-            ( Expr.HsApp GHC.NoExt
-                ( GHC.noLoc
-                    ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( hs_print names ) ) )
-                )
-                ( GHC.noLoc
-                    ( Expr.HsApp GHC.NoExt
-                        ( GHC.noLoc
-                            ( Expr.HsApp GHC.NoExt
-                                ( GHC.noLoc
-                                    ( Expr.HsVar GHC.NoExt
-                                        ( GHC.noLoc GHC.mappendName )
-                                    )
-                                )
-                                ( GHC.noLoc
-                                    ( Expr.HsLit GHC.NoExt
-                                        ( GHC.HsString
-                                            GHC.NoSourceText
-                                            ( GHC.fsLit ( GHC.renderWithStyle GHC.unsafeGlobalDynFlags ( GHC.ppr ( typedExpr te ) ) ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags ) ++ " = " ) )
-                                        )
-                                    )
-                                )
-                            )
-                        )
-                        ( GHC.noLoc
-                            ( Expr.HsApp GHC.NoExt
-                                ( GHC.noLoc ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( hs_show names ) ) ) )
-                                ( GHC.noLoc ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( GHC.idName name ) ) ) )
-                            )
-                        )
-                    )
-                )
-            )
-        )
-        ( GHC.mkRnSyntaxExpr GHC.thenIOName )
-        Expr.noSyntaxExpr
-
-    diagnosticFunction = 
-      foldl'
-        ( \e name -> abstract name e )
-        ( Expr.HsDo GHC.NoExt
-            Expr.DoExpr
-            ( GHC.noLoc
-                ( map
-                    GHC.noLoc
-                    ( zipWith diagnose showableSubExpresions diagnosticArgs
-                        ++
-                          [ Expr.LastStmt GHC.NoExt
-                              ( GHC.noLoc ( returnUnit names ) )
-                              False
-                              Expr.noSyntaxExpr
-                          ]
-                    )
-                ) 
-            ) 
-        )
-        ( reverse diagnosticArgs )
-
-  -- Build the type of the diagnostic function
-  let
-    fTy =
+    -- Build the type of the diagnostic function
+    diagnosticFunctionT =
       foldr
         GHC.mkFunTy
         ( GHC.mkTyConApp ( hs_IO names ) [ GHC.mkTyConTy GHC.unitTyCon ] )
         ( map typedExprType showableSubExpresions )
 
+  ( diagnosticFunction, _ ) <-
+    GHC.rnLExpr expr
+
+  -- Type check our diagnostic function to find which dictionaries need to be
+  -- resolved.
   ( GHC.L _ ifExpr', wanteds ) <-
     GHC.captureConstraints
       ( GHC.tcMonoExpr
-        ( GHC.noLoc diagnosticFunction )
-        ( GHC.Check fTy )
+        diagnosticFunction
+        ( GHC.Check diagnosticFunctionT )
       )
 
+  -- Solve wanted constraints and build a wrapper.
   wrapper <-
-    GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd <$> GHC.runTcS ( GHC.solveWanteds wanteds )
+    GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
+      <$> GHC.runTcS ( GHC.solveWanteds wanteds )
 
+  -- Apply the wrapper to our type checked syntax and fully saturate the
+  -- diagnostic function with the necessary arguments.
   GHC.zonkTopLExpr
     ( foldl
         ( \a b -> GHC.noLoc ( Expr.HsApp GHC.NoExt a b ) )
@@ -232,12 +209,56 @@ explain names e = do
     )
 
 
+diagnoseExpr :: Typed -> TH.Name -> TH.ExpQ
+diagnoseExpr te name =
+  let
+    ppExpr =
+      GHC.renderWithStyle
+        GHC.unsafeGlobalDynFlags
+        ( GHC.ppr ( typedExpr te ) )
+        ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags )
+  in
+  [| putStrLn ( ppExpr ++ " = " ++ show $( TH.varE name ) ) |]
+
+  -- GHC.mkHsApp
+  --   ( GHC.noLoc
+  --       ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( hs_print names ) ) )
+  --   )
+  --   ( GHC.mkHsApp
+  --       ( GHC.mkHsApp
+  --           ( GHC.noLoc ( Expr.HsVar GHC.NoExt ( GHC.noLoc GHC.mappendName ) ) )
+  --           ( GHC.noLoc
+  --               ( Expr.HsLit GHC.NoExt
+  --                   ( GHC.HsString
+  --                       GHC.NoSourceText
+  --                       ( GHC.fsLit
+  --                           ( 
+  --                           )
+  --                       )
+  --                   )
+  --               )
+  --           )
+  --       )
+  --       ( GHC.mkHsApp
+  --           ( GHC.noLoc
+  --               ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( hs_show names ) ) )
+  --           )
+  --           ( GHC.noLoc
+  --               ( Expr.HsVar GHC.NoExt ( GHC.noLoc ( GHC.idName name ) ) )
+  --           )
+  --       )
+  --   )
+
+
+
 isHsExpr :: Expr.HsExpr GHC.GhcTc -> Bool 
-isHsExpr ( Expr.HsPar{} ) =
+isHsExpr Expr.HsPar{} =
   False
-isHsExpr ( Expr.HsLit{} ) =
+isHsExpr Expr.HsLit{} =
   False
-isHsExpr ( Expr.HsOverLit{} ) =
+isHsExpr Expr.HsOverLit{} =
+  False
+isHsExpr Expr.HsWrap{} =
   False
 isHsExpr _ =
   True
@@ -305,4 +326,3 @@ abstract name e =
             ]
       , Expr.mg_origin = GHC.Generated
       }
-              
