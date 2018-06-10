@@ -136,7 +136,7 @@ explain toExplain = do
                 diags ->
                   [ TH.noBindS
                       ( TH.doE
-                          ( TH.noBindS [| putStrLn "I found the following sub-expressions:" |]
+                          ( TH.noBindS [| putStrLn "" >> putStrLn "  I found the following sub-expressions:" |]
                               : diags
                           )
                       )
@@ -151,7 +151,7 @@ explain toExplain = do
                 ( \e name -> TH.lam1E ( TH.varP name ) e )
                 ( TH.condE
                     ( TH.varE topName )
-                    [| return () |]
+                    ( assertionOk given )
                     ( TH.doE ( assertionFailed given : diagnosed ) )
                 )
                 ( reverse diagnosticArgs )
@@ -220,7 +220,7 @@ diagnoseExpr te name =
         ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags )
   in
   -- [| PP.putDoc ( PP.pretty ppExpr <> " = " <> PP.pretty ( show $( TH.varE name ) ) ) |]
-  [| putStrLn ( "  - " <> ppExpr <> " = " <> show $( TH.varE name ) ) |]
+  [| putStrLn ( "    - " <> ppExpr <> " = " <> show $( TH.varE name ) ) |]
 
 
 assertionFailed :: Typed -> TH.StmtQ
@@ -241,9 +241,28 @@ assertionFailed te =
   in
   TH.noBindS
     [| do
-         putStrLn ( "Assertion failed! " <> ppExpr <> " /= True (at " <> srcLoc <> ")" )
-         putStrLn ""
+         putStrLn ( "✘ Assertion failed! " <> ppExpr <> " /= True (at " <> srcLoc <> ")" )
     |]
+
+
+assertionOk :: Typed -> TH.ExpQ
+assertionOk te =
+  let
+    ppExpr =
+      GHC.renderWithStyle
+        GHC.unsafeGlobalDynFlags
+        ( GHC.ppr ( typedExpr te ) )
+        ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags )
+
+    srcLoc =
+      GHC.renderWithStyle
+        GHC.unsafeGlobalDynFlags
+        ( GHC.ppr ( case typedExpr te of GHC.L l _ -> l ) )
+        ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags )
+    
+  in
+  [| putStrLn ( "✔ " <> ppExpr <> " == True (at " <> srcLoc <> ")" )
+  |]
 
 
 isInterestingSubexpr :: Expr.LHsExpr GHC.GhcTc -> Bool

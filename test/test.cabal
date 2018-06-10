@@ -7,4 +7,3 @@ executable test
   default-language: Haskell2010
   build-depends: base, assert-explainer, prettyprinter
   main-is: Test.hs
-  ghc-options: -ddump-tc -ddump-ds
