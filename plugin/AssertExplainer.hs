@@ -8,6 +8,7 @@ module AssertExplainer ( plugin, assert ) where
 import qualified Constraint
 
 -- base
+import GHC.Stack ( HasCallStack, callStack, prettyCallStack )
 import Data.Bool ( bool )
 import Data.List ( foldl' )
 import Control.Monad ( guard )
@@ -81,14 +82,14 @@ explainAssertions _modSummary tcGblEnv = do
   return tcGblEnv { GHC.tcg_binds = tcg_binds }
 
 
-assert :: Bool -> IO ()
+assert :: HasCallStack => Bool -> IO ()
 assert =
-  bool ( fail "Assertion failed!" ) ( return () )
+  bool ( putStrLn ( "Assertion failed! " <> prettyCallStack callStack ) ) ( return () )
 
 
 -- | Rewrite an 'assert' call into further analysis on the expression being asserted.
 rewriteAssert :: GHC.Id -> Expr.LHsExpr GHC.GhcTc -> GHC.TcM ( Expr.LHsExpr GHC.GhcTc )
-rewriteAssert assertName ( GHC.L _ ( Expr.HsApp _ ( GHC.L _ ( Expr.HsVar _ ( GHC.L _ v ) ) ) body ) ) | assertName == v = do
+rewriteAssert assertName ( GHC.L _ ( Expr.HsApp _ ( GHC.L _ ( Expr.HsWrap _ _ ( Expr.HsVar _ ( GHC.L _ v ) ) ) ) body ) ) | assertName == v = do
   explain body
 rewriteAssert _ e =
   return e
@@ -241,7 +242,7 @@ assertionFailed te =
   in
   TH.noBindS
     [| do
-         putStrLn ( "✘ Assertion failed! " <> ppExpr <> " /= True (at " <> srcLoc <> ")" )
+         putStrLn ( "✘ Assertion failed!\n    " <> ppExpr <> " /= True (at " <> srcLoc <> ")" )
     |]
 
 
