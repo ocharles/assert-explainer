@@ -1,24 +1,21 @@
 #+TITLE: Assert Explainer (or: can we have py.test in Haskell?)
 
-Assert Explainer is a library & GHC plugin to help writing
-assertions. In particular, it is to help you understand *why* an
-assertion has failed.
+Assert Explainer is a library & GHC source plugin to help writing assertions. In
+particular, it is to help you understand *why* an assertion has failed.
 
 How many times have you written some kind of unit test assertion like
 
 #+BEGIN_SRC haskell
-  assertEqual (length xs) == 4
+  assert (length xs == 4)
 #+END_SRC
 
 And got:
 
 #+BEGIN_SRC
-expected: 4
-actual: 3
-#+END_SRC
+exception: Assertion failed!
+#+END_RC
 
-In this case this isn't awful, but you might have a lot more luck
-understanding why something is 3 if you could see what the list was.
+This sucks! Why did the assertion fail? When things have gone wrong, it's too late to find out way - the information has gone.
 
 With AssertExplainer, you simply write =Bool=-valued expressions, and
 the plugin will take care of the rest.
@@ -40,8 +37,12 @@ No need for lots of special =assertEqual= etc functions.
 When the assertion fails, you will get much more context:
 
 #+BEGIN_SRC
-Assertion failed!
-xs: [Foo 1, Foo 2, Foo 3 ]
+✘ Assertion failed!
+    length xs == 4 /= True (at Test.hs:18:12-25)
+
+  I found the following sub-expressions:
+    - length xs = 3
+    - xs = [1,2,3]
 #+END_SRC
 
 Ultimately, my goal is to write something more akin to
