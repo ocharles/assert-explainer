@@ -13,7 +13,7 @@ And got:
 
 #+BEGIN_SRC
 exception: Assertion failed!
-#+END_RC
+#+END_SRC
 
 This sucks! Why did the assertion fail? When things have gone wrong, it's too late to find out way - the information has gone.
 
