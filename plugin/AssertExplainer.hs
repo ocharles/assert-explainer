@@ -196,15 +196,8 @@ explain toExplain = do
       )
 
   -- Solve wanted constraints and build a wrapper.
-  evBinds <-
-    GHC.EvBinds <$> GHC.simplifyTop wanteds
-
-  ( _, zonkedEvBinds ) <-
-    GHC.zonkTcEvBinds GHC.emptyZonkEnv evBinds
-
-  let
-    wrapper =
-      GHC.mkWpLet zonkedEvBinds
+  wrapper <-
+    GHC.mkWpLet . GHC.EvBinds <$> GHC.simplifyTop wanteds
 
   -- Apply the wrapper to our type checked syntax and fully saturate the
   -- diagnostic function with the necessary arguments.
