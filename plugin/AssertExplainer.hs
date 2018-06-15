@@ -32,7 +32,6 @@ import qualified TcEvidence as GHC
 import qualified TcExpr as GHC
 import qualified TcHsSyn as GHC
 import qualified TcRnMonad as GHC
-import qualified TcSMonad as GHC ( runTcS )
 import qualified TcSimplify as GHC
 import qualified TcType as GHC
 
@@ -70,7 +69,12 @@ explainAssertions _modSummary tcGblEnv = do
     GHC.getTopEnv
 
   GHC.Found _ assertExplainerModule <-
-    liftIO ( GHC.findImportedModule hscEnv ( GHC.mkModuleName "AssertExplainer" ) Nothing )
+    liftIO
+      ( GHC.findImportedModule
+          hscEnv
+          ( GHC.mkModuleName "AssertExplainer" )
+          Nothing
+      )
 
   assertName <-
     GHC.lookupId
@@ -84,7 +88,9 @@ explainAssertions _modSummary tcGblEnv = do
 
 assert :: HasCallStack => Bool -> IO ()
 assert =
-  bool ( putStrLn ( "Assertion failed! " <> prettyCallStack callStack ) ) ( return () )
+  bool
+    ( putStrLn ( "Assertion failed! " <> prettyCallStack callStack ) )
+    ( return () )
 
 
 -- | Rewrite an 'assert' call into further analysis on the expression being asserted.
@@ -137,7 +143,10 @@ explain toExplain = do
                 diags ->
                   [ TH.noBindS
                       ( TH.doE
-                          ( TH.noBindS [| putStrLn "" >> putStrLn "  I found the following sub-expressions:" |]
+                          ( TH.noBindS
+                              [| putStrLn ""
+                                   >> putStrLn "  I found the following sub-expressions:"
+                               |]
                               : diags
                           )
                       )
@@ -188,8 +197,7 @@ explain toExplain = do
 
   -- Solve wanted constraints and build a wrapper.
   evBinds <-
-    GHC.EvBinds . GHC.evBindMapBinds . snd
-      <$> GHC.runTcS ( GHC.solveWanteds wanteds )
+    GHC.EvBinds <$> GHC.simplifyTop wanteds
 
   ( _, zonkedEvBinds ) <-
     GHC.zonkTcEvBinds GHC.emptyZonkEnv evBinds
@@ -220,8 +228,17 @@ diagnoseExpr te name =
         ( GHC.ppr ( typedExpr te ) )
         ( GHC.defaultUserStyle GHC.unsafeGlobalDynFlags )
   in
-  -- [| PP.putDoc ( PP.pretty ppExpr <> " = " <> PP.pretty ( show $( TH.varE name ) ) ) |]
-  [| putStrLn ( "    - " <> ppExpr <> " = " <> show $( TH.varE name ) ) |]
+  [|  PP.putDoc
+        ( PP.indent
+            4
+            ( PP.pretty "-"
+                PP.<+> PP.pretty ppExpr
+                PP.<+> PP.equals
+                PP.<+> PP.pretty ( show $( TH.varE name ) )
+            )
+            <> PP.line
+        )
+  |]
 
 
 assertionFailed :: Typed -> TH.StmtQ

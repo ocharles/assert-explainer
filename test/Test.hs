@@ -25,13 +25,9 @@ example4 =
 main = do
   putStrLn "Example 1"
   example1
-  getChar
 
   example2
-  getChar
 
   example3
-  getChar
 
   example4
-  getChar
